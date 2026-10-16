@@ -1,0 +1,85 @@
+#sceneDirector {
+    padding: 10px;
+    margin-bottom: 10px;
+}
+
+#sceneDirector label {
+    display: block;
+    margin-top: 8px;
+    font-weight: 600;
+}
+
+#sceneDirector label.checkbox_label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 500;
+}
+
+#sceneDirector label.checkbox_label small {
+    opacity: 0.7;
+    font-weight: 400;
+}
+
+.scene-director-strategies {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+    margin: 4px 0 8px;
+}
+
+.scene-director-strategies label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 500;
+    margin: 0;
+}
+
+#sceneDirector details {
+    margin-top: 10px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    padding: 6px 10px;
+}
+
+#sceneDirector summary {
+    cursor: pointer;
+    font-weight: 700;
+    user-select: none;
+}
+
+#sceneDirector .scene-director-log {
+    font-family: var(--monospaceFont), monospace;
+    font-size: 0.85em;
+    height: 180px;
+    white-space: pre;
+    overflow-x: hidden;
+}
+
+#sceneDirector .menu_button {
+    margin: 4px 4px 4px 0;
+}
+
+#rm_group_allow_self_responses,
+#rm_group_automode,
+#rm_group_hidemutedsprites,
+#sceneDirector_group_recursive,
+#sceneDirector_group_full_recursive,
+#sceneDirector_group_recursion_limit {
+    margin: 0 !important;
+}
+
+#sceneDirector_group_recursion_limit {
+    margin: 0 0 0 8px !important;
+    width: 6ch;
+}
+
+.scene-director-debug {
+    margin-top: 8px;
+    font-size: 0.9em;
+}
+
+#sceneDirector .text_pole {
+    width: 100%;
+}
