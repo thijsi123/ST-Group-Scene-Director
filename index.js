@@ -112,11 +112,12 @@ function defaultSettings() {
         toolChoice: 'forced',
         // Reasoning models spend tokens on their thinking trace BEFORE they emit
         // the tool call. 300 was not enough - the answer came back truncated with
-        // finish_reason "length" and no tool call at all.
+        // finish_reason "length" and no tool call at all. A trace can also take
+        // 20+ seconds, so the request timeout has to be generous as well.
         maxTokens: 1500,
-        tokenBudgetUpgraded: false,
+        budgetUpgraded: false,
         temperature: 0.2,
-        timeoutMs: 20000,
+        timeoutMs: 60000,
         retries: 1,
         fallbackOnFailure: true,
         historyDepth: 16,
@@ -137,17 +138,27 @@ function loadSettings() {
 const settings = loadSettings();
 
 /**
- * One-time upgrade for installs saved with the old 300-token default.
- * Reasoning models (thinking traces) burned that budget before emitting the
- * tool call, so every probe failed with finish_reason "length".
+ * One-time upgrade for installs saved with the old, too-tight defaults.
+ * Reasoning models (thinking traces) burned the 300-token budget before emitting
+ * the tool call, and a long trace also overran the 20s request timeout - both
+ * made every probe fail while looking like "the model can't call tools".
  */
-function upgradeTokenBudget() {
-    if (Number(settings.maxTokens) >= 1024 || settings.tokenBudgetUpgraded) return;
-    const previous = settings.maxTokens;
-    settings.maxTokens = 1500;
-    settings.tokenBudgetUpgraded = true;
+function upgradeDirectorBudget() {
+    if (settings.budgetUpgraded) return;
+    const notes = [];
+    if (Number(settings.maxTokens) < 1024) {
+        notes.push(`max tokens ${settings.maxTokens} -> 1500`);
+        settings.maxTokens = 1500;
+    }
+    if (Number(settings.timeoutMs) < 45000) {
+        notes.push(`timeout ${settings.timeoutMs}ms -> 60000ms`);
+        settings.timeoutMs = 60000;
+    }
+    settings.budgetUpgraded = true;
     saveSettings();
-    logDir(`Raised the director token budget ${previous} -> 1500 so reasoning models can finish thinking before they call the tool.`);
+    if (notes.length) {
+        logDir(`Raised the director budget (${notes.join(', ')}) so reasoning models can finish thinking before they call the tool.`);
+    }
 }
 
 function saveSettings() {
@@ -426,7 +437,7 @@ async function withTimeout(run, signal = null) {
         if (signal.aborted) onAbort();
         else signal.addEventListener('abort', onAbort, { once: true });
     }
-    const timeoutMs = Math.max(500, Number(settings.timeoutMs) || 20000);
+    const timeoutMs = Math.max(500, Number(settings.timeoutMs) || 60000);
     const timer = setTimeout(
         () => controller.abort(new DOMException('Director request timed out', 'TimeoutError')),
         timeoutMs,
@@ -499,7 +510,7 @@ async function runDirectorProbe(group, signal, { stage, justSpoke, latestUserInp
         messages: buildDirectorMessages(group, { stage, justSpoke, latestUserInput, mustContinue }),
         model: getChatCompletionModel(oai_settings),
         chat_completion_source: oai_settings.chat_completion_source,
-        max_tokens: Math.max(64, Number(settings.maxTokens) || 300),
+        max_tokens: Math.max(64, Number(settings.maxTokens) || 1500),
         temperature: Math.min(1, Math.max(0, Number(settings.temperature) ?? 0.2)),
         custom_prompt_post_processing: custom_prompt_post_processing_types.NONE,
         tools: [buildDirectorTool(group)],
@@ -1269,7 +1280,7 @@ const SETTINGS_HTML = `
                 <label for="sceneDirector_maxTokens" title="Budget for the director's answer. Reasoning models spend tokens on their thinking trace first - keep this generous (1024+), otherwise the answer is cut off before the tool call.">Max tokens</label>
                 <input id="sceneDirector_maxTokens" type="number" step="16" min="64">
 
-                <label for="sceneDirector_timeoutMs">Timeout (ms)</label>
+                <label for="sceneDirector_timeoutMs" title="Reasoning models can think for 20+ seconds before they call the tool. Keep this generous, otherwise slow but valid answers are aborted.">Timeout (ms)</label>
                 <input id="sceneDirector_timeoutMs" type="number" step="500" min="500">
 
                 <label for="sceneDirector_retries">Retries on invalid answer</label>
@@ -1359,8 +1370,8 @@ function bindElements() {
     bindControl('showDecisions', el => el.val(settings.showDecisions), el => settings.showDecisions = bindSelectValue('showDecisions'));
     bindControl('toolChoice', el => el.val(settings.toolChoice), el => settings.toolChoice = bindSelectValue('toolChoice'));
     bindControl('temperature', el => el.val(settings.temperature), el => settings.temperature = Math.min(1, Math.max(0, Number(el.val()) || 0)));
-    bindControl('maxTokens', el => el.val(settings.maxTokens), el => settings.maxTokens = Math.max(64, Number(el.val()) || 300));
-    bindControl('timeoutMs', el => el.val(settings.timeoutMs), el => settings.timeoutMs = Math.max(500, Number(el.val()) || 20000));
+    bindControl('maxTokens', el => el.val(settings.maxTokens), el => settings.maxTokens = Math.max(64, Number(el.val()) || 1500));
+    bindControl('timeoutMs', el => el.val(settings.timeoutMs), el => settings.timeoutMs = Math.max(500, Number(el.val()) || 60000));
     bindControl('retries', el => el.val(settings.retries), el => settings.retries = Math.min(5, Math.max(0, Number(el.val()) || 0)));
     bindControl('fallbackOnFailure', el => el.prop('checked', settings.fallbackOnFailure), el => settings.fallbackOnFailure = el.prop('checked'));
     bindControl('historyDepth', el => el.val(settings.historyDepth), el => settings.historyDepth = Math.min(40, Math.max(1, Number(el.val()) || 16)));
@@ -1461,7 +1472,7 @@ export async function init() {
     });
 
     migrateLegacyDirectorStrategies();
-    upgradeTokenBudget();
+    upgradeDirectorBudget();
 
     logDir('Scene Director initialized. Use the Test & Debug section to verify tool calling support.');
     console.log('[SceneDirector] initialized');
