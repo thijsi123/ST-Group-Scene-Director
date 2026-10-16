@@ -123,7 +123,8 @@ The extension injects extra controls into the **group edit panel** (next to
   Picking any other strategy + enabling the override checkboxes works as well.
 - **Scene Director: Recursive** *(checkbox)* + numeric input:
   - checked = chained/recursive scenes (probe → reply → probe …); unchecked =
-    batch-style single decision per turn.
+    batch-style single decision per turn. Until you touch it, the group simply
+    follows the global **Selection mode** setting.
   - the number is the **recursion limit** - how many AI replies one send may
     produce, `0` = unlimited (hard-capped at 50 for safety).
 - **Full recursive** *(checkbox)* - the director is not allowed to end the turn

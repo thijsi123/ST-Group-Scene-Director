@@ -276,7 +276,9 @@ function ensureGroupDirectorDefaults(group) {
     if (typeof group.sd_director !== 'boolean') {
         group.sd_director = Number(group.activation_strategy ?? -1) === SD_STRATEGY;
     }
-    if (typeof group.sd_recursive !== 'boolean') group.sd_recursive = settings.mode === 'chained';
+    // sd_recursive is deliberately left undefined until the user touches the
+    // per-group control - that keeps the global "Selection mode" setting working
+    // as the default for groups without an explicit override.
     if (group.sd_recursion_limit === undefined || group.sd_recursion_limit === null) group.sd_recursion_limit = 5;
     if (typeof group.sd_full_recursive !== 'boolean') group.sd_full_recursive = false;
     return group;
@@ -284,9 +286,8 @@ function ensureGroupDirectorDefaults(group) {
 
 function resolveTurnMode(group) {
     ensureGroupDirectorDefaults(group);
-    if (typeof group.sd_recursive === 'boolean') {
-        return group.sd_recursive ? 'chained' : 'batch';
-    }
+    if (group.sd_recursive === true) return 'chained';
+    if (group.sd_recursive === false) return 'batch';
     return settings.mode;
 }
 
@@ -1121,7 +1122,8 @@ function migrateLegacyDirectorStrategies() {
 /** Mirrors per-group state into the injected panel inputs + migrates legacy data. */
 function syncGroupEditControls() {
     const group = ensureGroupDirectorDefaults(openGroupId && groups.find(x => x.id === openGroupId));
-    $('#sceneDirector_group_recursive').prop('checked', Boolean(group?.sd_recursive));
+    const recursive = typeof group?.sd_recursive === 'boolean' ? group.sd_recursive : settings.mode === 'chained';
+    $('#sceneDirector_group_recursive').prop('checked', recursive);
     $('#sceneDirector_group_full_recursive').prop('checked', Boolean(group?.sd_full_recursive));
     $('#sceneDirector_group_recursion_limit').val(group?.sd_recursion_limit ?? 5);
 
