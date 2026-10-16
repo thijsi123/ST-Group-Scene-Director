@@ -219,8 +219,21 @@ function resolveAllowRepeat(group) {
     return Boolean(group.allow_self_responses);
 }
 
+/**
+ * True when the group should be driven by the director.
+ *
+ * The group edit panel's "Scene Director (recursive)" entry (value SD_STRATEGY)
+ * is a UI alias: it is stored as this flag plus a stock activation strategy.
+ * The raw value 4 must never reach generateGroupWrapper() because it has no
+ * activation branch there - core then finds nobody to activate and posts an
+ * EMPTY USER MESSAGE whenever we are not steering (auto mode, disabled
+ * extension, failed probe, manual "speak" clicks, some swipe types...).
+ */
 function isDirectorStrategy(group) {
-    return Number(group?.activation_strategy ?? group_activation_strategy.NATURAL) === SD_STRATEGY;
+    if (!group) return false;
+    if (group.sd_director === true) return true;
+    // Legacy groups saved before the alias change still carry the raw value.
+    return Number(group.activation_strategy ?? group_activation_strategy.NATURAL) === SD_STRATEGY;
 }
 
 // #region Per-group director settings
@@ -231,6 +244,9 @@ function isDirectorStrategy(group) {
  */
 function ensureGroupDirectorDefaults(group) {
     if (!group) return null;
+    if (typeof group.sd_director !== 'boolean') {
+        group.sd_director = Number(group.activation_strategy ?? -1) === SD_STRATEGY;
+    }
     if (typeof group.sd_recursive !== 'boolean') group.sd_recursive = settings.mode === 'chained';
     if (group.sd_recursion_limit === undefined || group.sd_recursion_limit === null) group.sd_recursion_limit = 5;
     if (typeof group.sd_full_recursive !== 'boolean') group.sd_full_recursive = false;
@@ -599,13 +615,20 @@ function applyRoster(group, orderedAvatars) {
     return snapshot;
 }
 
-/** Mutes everyone: the turn will have zero AI replies (used when fallback is disabled). */
-function applyEmptyTurn(group) {
-    const snapshot = snapshotGroup(group);
-    if (!Array.isArray(group.disabled_members)) group.disabled_members = [];
-    group.activation_strategy = group_activation_strategy.LIST;
-    replaceInPlace(group.disabled_members, [...enabledAvatars(group)]);
-    return snapshot;
+/**
+ * Picks a random enabled member - used when the director fails and the user
+ * turned the stock-activation fallback off. Never returns an avatar that is
+ * banned by the repeat policy (unless it is the only option).
+ */
+function pickFallbackSpeaker(group, justSpoke) {
+    const roster = enabledAvatars(group);
+    if (!roster.length) return null;
+    const allowRepeat = resolveAllowRepeat(group);
+    const pool = (!allowRepeat && justSpoke && roster.length > 1)
+        ? roster.filter(avatar => avatar !== justSpoke)
+        : roster;
+    const candidates = pool.length ? pool : roster;
+    return candidates[Math.floor(Math.random() * candidates.length)] ?? null;
 }
 
 function restoreGroup(group, snapshot) {
@@ -621,22 +644,76 @@ function restoreGroup(group, snapshot) {
 // #region Turn flow
 
 /**
+ * Lets SillyTavern's stock activation handle this turn.
+ *
+ * Needed because our custom "Group reply strategy" value (SD_STRATEGY) has no
+ * activation branch in generateGroupWrapper(): if nothing mutates the group,
+ * core finds nobody to activate and posts the (possibly EMPTY) user message -
+ * that is the empty "user" bubble bug. Swapping the strategy back to NATURAL
+ * for this turn keeps the group usable even if the director is off/failing.
+ */
+function beginStockFallbackTurn(group, options = {}, reason = '') {
+    const needsStrategySwap = isDirectorStrategy(group);
+    state.turn = {
+        groupId: group.id,
+        mode: 'stock',
+        phase: 'stock',
+        snapshot: needsStrategySwap ? snapshotGroup(group) : null,
+        signal: options?.signal instanceof AbortSignal ? options.signal : null,
+        lastSpeaker: null,
+        count: 0,
+        chainCap: 1,
+        full: false,
+    };
+    if (needsStrategySwap) {
+        group.activation_strategy = group_activation_strategy.NATURAL;
+    }
+    logDir(`Stock activation for this turn (${reason})${needsStrategySwap ? ` - reply strategy ${SD_STRATEGY} temporarily swapped to NATURAL (restored on wrapper start)` : ''}`);
+    return state.turn;
+}
+
+/**
  * Runs the director and prepares the roster for the original wrapper.
  * Runs during the awaited GENERATION_AFTER_COMMANDS event for the user's turn.
  */
 async function onGenerationAfterCommands(type, options = {}, dryRun = false) {
     try {
-        if (dryRun || !settings.enabled) return;
-        if (type !== 'normal') return; // swipes/continues/impersonate stay stock
-        if (isBusy() || is_group_generating) return;
-        if (is_group_automode_enabled) return; // automode runs its own wrapper directly
+        if (dryRun) return;
+
+        // A new top-level generation means any turn we still hold in 'first'/'batch'/
+        // 'stock' phase is stale: its wrapper already ran (or bailed out before emitting
+        // GROUP_WRAPPER_STARTED/FINISHED, e.g. no backend connection). Release it, or the
+        // group would stay mutated and the extension would block itself forever.
+        // 'chain' is skipped: our own continuation loop owns it.
+        if (!is_group_generating && state.turn && state.turn.phase !== 'chain') {
+            logDir(`Releasing stale turn (${state.turn.mode}/${state.turn.phase})`, { level: 'warn' });
+            restoreGroup(groups.find(x => x.id === state.turn.groupId), state.turn.snapshot);
+            state.turn = null;
+        }
 
         const group = getGroup();
         if (!group || !Array.isArray(group.members) || !group.members.length) return;
-        if (!strategyApplies(group)) return;
 
         const roster = enabledAvatars(group);
-        if (!roster.length) return;
+        const steerThisTurn = settings.enabled
+            && type === 'normal'
+            && !isBusy()
+            && !is_group_generating
+            && !is_group_automode_enabled
+            && strategyApplies(group)
+            && roster.length > 0
+            // A numeric force_chid means the user explicitly targeted a member
+            // (member "speak" click) - never override that.
+            && options?.force_chid === undefined;
+
+        if (!steerThisTurn) {
+            // "quiet" generations have their own activation branch and must not touch
+            // group state. Everything else on a director-strategy group needs the swap.
+            if (isDirectorStrategy(group) && type !== 'quiet' && !isBusy() && !is_group_generating) {
+                beginStockFallbackTurn(group, options, 'director is not steering this turn');
+            }
+            return;
+        }
 
         const signal = options?.signal instanceof AbortSignal ? options.signal : new AbortController().signal;
         const latestUserInput = getLatestUserInput();
@@ -662,13 +739,33 @@ async function onGenerationAfterCommands(type, options = {}, dryRun = false) {
 
         if (!first?.avatar) {
             state.lastError = state.lastError ?? 'Director did not pick a first speaker';
-            toastr.warning(state.lastError, 'Scene Director');
-            logDir(`First speaker: none (fallback=${settings.fallbackOnFailure ? 'stock activation' : 'silent turn'})`, { level: 'warn' });
+            logDir(`First speaker: none - ${settings.fallbackOnFailure ? 'falling back to stock activation' : 'picking a random member'} instead`, { level: 'warn' });
+            toastr.warning(`${state.lastError}. Check Test & Debug - does your API/model support tool calls?`, 'Scene Director');
+
+            // Never leave the turn with an empty roster: core would post an empty user message.
+            state.turn = null;
             if (settings.fallbackOnFailure) {
-                restoreOnAbandon(); // stock activation proceeds
+                beginStockFallbackTurn(group, options, 'director failed');
             } else {
-                state.turn.snapshot = applyEmptyTurn(group); // nobody speaks this turn
-                state.turn.phase = 'silent';
+                const pick = pickFallbackSpeaker(group, justSpoke);
+                if (!pick) {
+                    beginStockFallbackTurn(group, options, 'no enabled members to pick from');
+                } else {
+                    const turn = {
+                        groupId: group.id,
+                        mode,
+                        phase: mode === 'chained' ? 'first' : 'batch',
+                        snapshot: null,
+                        signal,
+                        lastSpeaker: pick,
+                        count: 1,
+                        chainCap,
+                        full: false,
+                    };
+                    state.turn = turn;
+                    turn.snapshot = applyRoster(group, [pick]);
+                    logDir(`Random fallback speaker: ${charNameByAvatar(pick)}`);
+                }
             }
             return;
         }
@@ -761,7 +858,9 @@ async function runChainedTurn(turn) {
 
             turn.count++;
             logDir(`Recursive beat ${turn.count}: ${charNameByAvatar(decision.avatar)} speaking`);
-            await generateGroupWrapper(false, 'normal', {
+            // byAutoMode = true: these beats are AI-initiated, so SillyTavern must not
+            // insert a user message (nor its "send if empty" text) between replies.
+            await generateGroupWrapper(true, 'normal', {
                 force_chid: chId,
                 signal: turn.signal,
             });
@@ -823,7 +922,7 @@ async function onGroupWrapperFinished(payload = {}) {
     }
 
     if (turn.phase !== 'chain') {
-        // batch or silent turns end with the original wrapper
+        // batch / stock turns end with the original wrapper
         state.turn = null;
     }
     // phase 'chain': runChainedTurn() owns this turn and cleans up
@@ -882,6 +981,40 @@ function injectGroupEditControls() {
             await saveGroupFields(group);
         });
     }
+
+    // Strategy select: our option is a UI alias - core's own handler stores the
+    // raw value, so translate it here (this handler runs right after core's).
+    if (strategySelect.length && !strategySelect.data('sceneDirectorBound')) {
+        strategySelect.data('sceneDirectorBound', true);
+        strategySelect.on('change', () => { void onDirectorStrategyChange(); });
+    }
+}
+
+/**
+ * Translates the "Scene Director (recursive)" select option into the group flag
+ * plus a stock activation strategy, so SillyTavern's own activation stays usable.
+ */
+async function onDirectorStrategyChange() {
+    const group = ensureGroupDirectorDefaults(openGroupId ? groups.find(x => x.id === openGroupId) : null);
+    if (!group) return;
+    const value = Number($('#rm_group_activation_strategy').find(':selected').val());
+
+    if (value === SD_STRATEGY) {
+        group.sd_director = true;
+        if (Number(group.activation_strategy) === SD_STRATEGY) {
+            group.activation_strategy = group_activation_strategy.NATURAL;
+        }
+        logDir(`Group "${group.name}": Scene Director reply strategy enabled (director flag + stock strategy ${group.activation_strategy})`);
+    } else if (group.sd_director) {
+        group.sd_director = false;
+        group.activation_strategy = value;
+        logDir(`Group "${group.name}": Scene Director reply strategy disabled (stock strategy ${value})`);
+    } else {
+        return; // nothing of ours changed
+    }
+
+    await saveGroupFields(group);
+    syncGroupEditControls();
 }
 
 /** Persists per-group fields through the same core path the group panel uses. */
@@ -893,12 +1026,47 @@ async function saveGroupFields(group) {
     }
 }
 
-/** Mirrors per-group state into the injected panel inputs. */
+/**
+ * Migrates every group that still stores the raw SD_STRATEGY value.
+ * Auto mode (and any other turn we cannot hook) calls generateGroupWrapper()
+ * directly, so leaving value 4 on disk would keep producing empty user
+ * messages there - the migration must not depend on opening that group's panel.
+ */
+function migrateLegacyDirectorStrategies() {
+    let migrated = 0;
+    for (const group of groups) {
+        if (Number(group?.activation_strategy) !== SD_STRATEGY) continue;
+        group.sd_director = true;
+        group.activation_strategy = group_activation_strategy.NATURAL;
+        migrated++;
+        logDir(`Group "${group.name}": migrated reply strategy ${SD_STRATEGY} -> director flag + natural order (auto mode / stock activation keep working)`);
+        void saveGroupFields(group);
+    }
+    return migrated;
+}
+
+/** Mirrors per-group state into the injected panel inputs + migrates legacy data. */
 function syncGroupEditControls() {
     const group = ensureGroupDirectorDefaults(openGroupId && groups.find(x => x.id === openGroupId));
     $('#sceneDirector_group_recursive').prop('checked', Boolean(group?.sd_recursive));
     $('#sceneDirector_group_full_recursive').prop('checked', Boolean(group?.sd_full_recursive));
     $('#sceneDirector_group_recursion_limit').val(group?.sd_recursion_limit ?? 5);
+
+    if (!group) return;
+
+    const rawStrategy = Number(group.activation_strategy ?? group_activation_strategy.NATURAL);
+    if (rawStrategy === SD_STRATEGY) {
+        // Migrate legacy groups that stored the raw value: keep the director on,
+        // give the group a strategy SillyTavern's own activation understands.
+        group.sd_director = true;
+        group.activation_strategy = group_activation_strategy.NATURAL;
+        logDir(`Group "${group.name}": migrated reply strategy ${SD_STRATEGY} -> director flag + natural order (stock activation keeps working)`);
+        void saveGroupFields(group);
+    }
+
+    // Show our option again if the group is director-driven.
+    const display = isDirectorStrategy(group) ? SD_STRATEGY : rawStrategy;
+    $('#rm_group_activation_strategy').val(String(display));
 }
 
 // #endregion
@@ -1041,9 +1209,9 @@ const SETTINGS_HTML = `
                 <label for="sceneDirector_retries">Retries on invalid answer</label>
                 <input id="sceneDirector_retries" type="number" step="1" min="0" max="5">
 
-                <label class="checkbox_label">
+                <label class="checkbox_label" title="On: SillyTavern's normal activation picks the speaker. Off: the extension picks a random enabled member. Either way the turn always gets a speaker - a director-strategy group with nobody activated would post an empty user message.">
                     <input id="sceneDirector_fallbackOnFailure" type="checkbox">
-                    <span>Fall back to stock activation when the director fails</span>
+                    <span>If the director fails, fall back to stock activation (off: pick a random member)</span>
                 </label>
             </details>
 
@@ -1218,11 +1386,15 @@ export async function init() {
     eventSource.on(event_types.GROUP_WRAPPER_STARTED, onGroupWrapperStarted);
     eventSource.on(event_types.GROUP_WRAPPER_FINISHED, onGroupWrapperFinished);
     eventSource.on(event_types.GROUP_UPDATED, syncGroupEditControls);
+    eventSource.on(event_types.CHAT_CHANGED, syncGroupEditControls);
+    eventSource.on(event_types.APP_READY, migrateLegacyDirectorStrategies);
     eventSource.on(event_types.GENERATION_STOPPED, () => {
         const turn = state.turn;
         logDir(`Generation stopped (turn=${turn ? turn.mode + '/' + turn.phase : 'none'})`, { level: 'warn' });
         restoreOnAbandon();
     });
+
+    migrateLegacyDirectorStrategies();
 
     logDir('Scene Director initialized. Use the Test & Debug section to verify tool calling support.');
     console.log('[SceneDirector] initialized');

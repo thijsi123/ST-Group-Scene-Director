@@ -85,10 +85,12 @@ Quick check that tool calling works with your setup: open the extension settings
   "Self responses" toggle.
 - **Show decisions** - hidden (console only), toast, or small system message.
 - Director request: **tool choice** (forced `tool_choice` vs `auto`),
-  temperature, max tokens, timeout, retries, and fallback behavior.
-  - *Fall back to stock activation*: on director failure, the normal
-    SillyTavern selection runs. If off, the turn produces **no** AI reply
-    (a deterministic "quiet beat").
+  temperature, max tokens, timeout, retries, and fallback behavior:
+  - *If the director fails*: **on** (default) = SillyTavern's normal activation
+    picks the speaker for that turn; **off** = the extension picks a random
+    enabled member. Either way the turn always gets **exactly one** fallback
+    speaker - the extension never leaves a group with an empty activation,
+    because SillyTavern would then post an empty *user* message into the chat.
 - Context & members: how many recent chat messages the director sees, message
   character limit, and whether the roster includes short descriptions per member.
 - Advanced: delay between chained replies, extra instructions for the director
@@ -102,9 +104,14 @@ The extension injects extra controls into the **group edit panel** (next to
 "Allow self responses" / "Auto Mode") and one new entry into the
 **Group reply strategy** select:
 
-- **Reply strategy "Scene Director (recursive)"** - value 4. When selected, the
-  director drives the group every turn; the per-strategy override checkboxes
-  above are bypassed for that group (the master **Enable** switch still applies).
+- **Reply strategy "Scene Director (recursive)"** - a UI alias. Selecting it turns
+  on the per-group director flag and stores a stock strategy (*Natural order*)
+  next to it. This matters: a raw strategy value the core does not know would
+  make SillyTavern find nobody to activate and post an **empty user message**
+  whenever the extension is not steering that particular turn (auto mode,
+  extension switched off, failed probe, manual "speak" clicks). Legacy groups
+  that stored the old value are migrated automatically the next time the group
+  panel is opened.
   Picking any other strategy + enabling the override checkboxes works as well.
 - **Scene Director: Recursive** *(checkbox)* + numeric input:
   - checked = chained/recursive scenes (probe → reply → probe …); unchecked =
@@ -130,6 +137,11 @@ The settings panel has a **Test & Debug** section:
 
 ## Known limitations
 
+- **A group set to the "Scene Director (recursive)" reply strategy needs this
+  extension switched on** to actually be director-driven. Because the option is
+  stored as a director flag + *Natural order*, such a group degrades gracefully
+  into a stock Natural-order group instead (see above) - it never posts an empty
+  user message.
 - **Auto-mode** turns (the periodic "continue chat" timer) are not directed -
   they bypass user-triggered generation. Manual sends and group swipes behave stock.
 - The temporary roster swap briefly mutes non-selected members *before the
