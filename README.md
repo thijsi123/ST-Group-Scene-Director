@@ -71,6 +71,13 @@ Quick check that tool calling works with your setup: open the extension settings
   The director is a separate small request and does **not** need SillyTavern's
   own "Function calling" toggle - but the underlying API/model must support
   `tools` / `tool_choice`.
+- **Enough token budget for the director.** Reasoning models spend tokens on
+  their thinking trace *before* they emit the tool call; with too small a budget
+  the answer comes back truncated (`finish_reason: "length"`) with no tool call,
+  which looks exactly like "the model can't call tools". The default is 1500
+  tokens and the extension automatically retries once with three times the
+  budget when it detects that truncation - if the log still shows `length`, raise
+  **Max tokens** further.
 
 ## Settings
 

@@ -110,7 +110,11 @@ function defaultSettings() {
         maxSpeakersPerTurn: 5,
         allowRepeat: 'group', // 'group' | 'always' | 'never'
         toolChoice: 'forced',
-        maxTokens: 300,
+        // Reasoning models spend tokens on their thinking trace BEFORE they emit
+        // the tool call. 300 was not enough - the answer came back truncated with
+        // finish_reason "length" and no tool call at all.
+        maxTokens: 1500,
+        tokenBudgetUpgraded: false,
         temperature: 0.2,
         timeoutMs: 20000,
         retries: 1,
@@ -131,6 +135,20 @@ function loadSettings() {
 }
 
 const settings = loadSettings();
+
+/**
+ * One-time upgrade for installs saved with the old 300-token default.
+ * Reasoning models (thinking traces) burned that budget before emitting the
+ * tool call, so every probe failed with finish_reason "length".
+ */
+function upgradeTokenBudget() {
+    if (Number(settings.maxTokens) >= 1024 || settings.tokenBudgetUpgraded) return;
+    const previous = settings.maxTokens;
+    settings.maxTokens = 1500;
+    settings.tokenBudgetUpgraded = true;
+    saveSettings();
+    logDir(`Raised the director token budget ${previous} -> 1500 so reasoning models can finish thinking before they call the tool.`);
+}
 
 function saveSettings() {
     saveSettingsDebounced();
@@ -421,6 +439,53 @@ async function withTimeout(run, signal = null) {
     }
 }
 
+/** Pulls choices[0] and its tool calls out of a raw response. */
+function readCompletion(json) {
+    const choices = Array.isArray(json?.choices) ? json.choices : [];
+    const choice = choices.find(c => c?.index === 0) ?? choices[0] ?? null;
+    const message = choice?.message ?? {};
+    return {
+        choice,
+        finishReason: String(choice?.finish_reason ?? ''),
+        content: String(message.content ?? ''),
+        reasoning: String(message.reasoning_content ?? message.reasoning ?? ''),
+        toolCalls: Array.isArray(message.tool_calls) ? message.tool_calls : [],
+    };
+}
+
+/**
+ * Sends the director request and retries once with a bigger budget when the
+ * model was cut off before it could call the tool - the classic case being a
+ * reasoning model whose thinking trace consumed all of max_tokens (that showed
+ * up as finish_reason "length", empty content and no tool_calls).
+ */
+async function requestDirectorCompletion(payload, signal, label) {
+    const send = p => withTimeout(s => ChatCompletionService.processRequest(p, {}, false, s), signal);
+    let json = await send(payload);
+    let result = readCompletion(json);
+
+    if (!result.toolCalls.length && result.finishReason === 'length') {
+        const asked = Math.max(64, Number(payload.max_tokens) || 0);
+        const bigger = Math.min(8192, Math.max(1024, asked * 3));
+        logDir(`${label}: the answer was cut off at ${asked} tokens${result.reasoning.length ? ` (thinking trace: ${result.reasoning.length} chars used the budget)` : ''} - retrying with ${bigger}.`, { level: 'warn' });
+        json = await send({ ...payload, max_tokens: bigger });
+        result = readCompletion(json);
+    }
+
+    const summary = [
+        `finish_reason=${result.finishReason || 'n/a'}`,
+        `tool_calls=${result.toolCalls.length}`,
+        `content=${result.content.length} chars`,
+        result.reasoning.length ? `thinking=${result.reasoning.length} chars` : '',
+    ].filter(Boolean).join(', ');
+    logDir(`${label}: ${summary}`);
+    if (result.reasoning.length && !result.toolCalls.length) {
+        logDir(`${label}: the model thought but never called the tool (reasoning shown in the thinking log).`, { level: 'warn' });
+    }
+
+    return json;
+}
+
 /**
  * Runs one director probe. Returns a decision:
  * { shouldContinue: boolean, avatar: string|null, reasoning: string }
@@ -453,14 +518,11 @@ async function runDirectorProbe(group, signal, { stage, justSpoke, latestUserInp
     }
 
     state.lastPayload = payload;
-    logDir(`Probe [${stage}] -> ${oai_settings.chat_completion_source} / ${payload.model} (tool_choice=${settings.toolChoice}${mustContinue ? ', full-recursive' : ''})`);
+    logDir(`Probe [${stage}] -> ${oai_settings.chat_completion_source} / ${payload.model} (tool_choice=${settings.toolChoice}${mustContinue ? ', full-recursive' : ''}, max_tokens=${payload.max_tokens})`);
 
     let json;
     try {
-        json = await withTimeout(
-            probeSignal => ChatCompletionService.processRequest(payload, {}, false, probeSignal),
-            signal,
-        );
+        json = await requestDirectorCompletion(payload, signal, `Probe [${stage}]`);
     } catch (error) {
         state.lastError = `Director request failed: ${error?.message ?? error}`;
         logDir(state.lastError, { level: 'error' });
@@ -1090,7 +1152,7 @@ async function runToolingSelfTest() {
             ],
             model: getChatCompletionModel(oai_settings),
             chat_completion_source: oai_settings.chat_completion_source,
-            max_tokens: Math.max(64, Number(settings.maxTokens) || 300),
+            max_tokens: Math.max(64, Number(settings.maxTokens) || 1500),
             temperature: 0,
             custom_prompt_post_processing: custom_prompt_post_processing_types.NONE,
             tools: [tool],
@@ -1109,7 +1171,7 @@ async function runToolingSelfTest() {
             }
         }
 
-        const json = await withTimeout(signal => ChatCompletionService.processRequest(payload, {}, false, signal), null);
+        const json = await requestDirectorCompletion(payload, null, 'Self test');
         const choices = Array.isArray(json?.choices) ? json.choices : [];
         const choice = choices.find(c => c?.index === 0) ?? choices[0] ?? null;
         const toolCalls = Array.isArray(choice?.message?.tool_calls) ? choice.message.tool_calls : [];
@@ -1129,8 +1191,12 @@ async function runToolingSelfTest() {
             logDir(`SELF TEST PASSED in ${Date.now() - started} ms - tool calling works for ${oai_settings.chat_completion_source}`);
             toastr.success('Tool calling works - the Scene Director can use this API/model.', 'Scene Director');
         } else {
+            const reason = String(choice?.finish_reason ?? '');
+            const hint = reason === 'length'
+                ? ' - the model ran out of tokens before it called the tool; raise "Max tokens"'
+                : '';
             state.lastTest = { ok: false, error: 'No scene_director tool call in response', ms: Date.now() - started };
-            logDir('SELF TEST FAILED: the response contained no scene_director tool call. Either unsupported tool API or tool_choice was ignored by the backend.', { level: 'error' });
+            logDir(`SELF TEST FAILED: the response contained no scene_director tool call (finish_reason=${reason || 'n/a'}${hint}). Either unsupported tool API or tool_choice was ignored by the backend.`, { level: 'error' });
             toastr.error('Tool calling self test failed - open the log for details.', 'Scene Director');
         }
     } catch (error) {
@@ -1200,7 +1266,7 @@ const SETTINGS_HTML = `
                 <label for="sceneDirector_temperature">Temperature</label>
                 <input id="sceneDirector_temperature" type="number" step="0.1" min="0" max="1">
 
-                <label for="sceneDirector_maxTokens">Max tokens</label>
+                <label for="sceneDirector_maxTokens" title="Budget for the director's answer. Reasoning models spend tokens on their thinking trace first - keep this generous (1024+), otherwise the answer is cut off before the tool call.">Max tokens</label>
                 <input id="sceneDirector_maxTokens" type="number" step="16" min="64">
 
                 <label for="sceneDirector_timeoutMs">Timeout (ms)</label>
@@ -1395,6 +1461,7 @@ export async function init() {
     });
 
     migrateLegacyDirectorStrategies();
+    upgradeTokenBudget();
 
     logDir('Scene Director initialized. Use the Test & Debug section to verify tool calling support.');
     console.log('[SceneDirector] initialized');
